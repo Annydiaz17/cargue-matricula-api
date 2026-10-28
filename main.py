@@ -32,6 +32,30 @@ DB_DSN = os.getenv("DB_DSN")
 
 TIPOS_ARCHIVO_VALIDOS = ['ANEXO_6A', 'DETALLADO', 'PLANTAGEN1', 'ESTABLECIMIENTOS', 'SEDES']
 
+
+def leer_archivo(file_bytes: bytes, filename: str):
+    """Devuelve (df, filas_omitidas). Todo se lee como texto: si pandas infiere
+    numeros, los codigos DANE se convierten en decimales y dejan de cruzar."""
+    filas_omitidas = 0
+
+    if filename.lower().endswith('.csv'):
+        try:
+            df = pd.read_csv(io.BytesIO(file_bytes), encoding='utf-8', sep=';',
+                             dtype=str, on_bad_lines='skip')
+        except UnicodeDecodeError:
+            df = pd.read_csv(io.BytesIO(file_bytes), encoding='latin1', sep=';',
+                             dtype=str, on_bad_lines='skip')
+
+        lineas = file_bytes.count(b'\n')
+        if file_bytes and not file_bytes.endswith(b'\n'):
+            lineas += 1
+        filas_omitidas = max(lineas - 1 - len(df), 0)
+    else:
+        df = pd.read_excel(io.BytesIO(file_bytes), engine='openpyxl', dtype=str)
+
+    return df.fillna(''), filas_omitidas
+
+
 def procesar_y_llamar_paquete(
     file_bytes: bytes, 
     filename: str, 
@@ -47,21 +71,15 @@ def procesar_y_llamar_paquete(
     try:
         huella_archivo = hashlib.sha256(file_bytes).hexdigest()
 
-        # Lectura de archivo (Soporte XLSX, XLS y CSV con sep=';' obligatorio)
-        if filename.lower().endswith('.csv'):
-            try:
-                df = pd.read_csv(io.BytesIO(file_bytes), encoding='utf-8', sep=';', on_bad_lines='skip')
-            except UnicodeDecodeError:
-                df = pd.read_csv(io.BytesIO(file_bytes), encoding='latin1', sep=';', on_bad_lines='skip')
-        else:
-            df = pd.read_excel(io.BytesIO(file_bytes), engine='openpyxl')
-
-        df = df.fillna('')
+        df, filas_omitidas = leer_archivo(file_bytes, filename)
         total_filas = len(df)
 
-        usuario_conexion = f"{DB_USER}[{DB_SCHEMA}]"
+        if filas_omitidas:
+            print(f"[{filename}] {datetime.datetime.now()} "
+                  f"ATENCION: {filas_omitidas} linea(s) del archivo no se pudieron leer.")
+
         connection = oracledb.connect(
-            user=usuario_conexion,
+            user=DB_USER,
             password=DB_PASSWORD,
             dsn=DB_DSN
         )
@@ -87,6 +105,11 @@ def procesar_y_llamar_paquete(
 
         # RUTA SEGÚN TIPO DE ARCHIVO
         if tipo_archivo == 'ANEXO_6A':
+            mensaje_inicial = 'Iniciando procesamiento ANEXO_6A'
+            if filas_omitidas:
+                mensaje_inicial += (f' | ATENCION: {filas_omitidas} linea(s) del archivo '
+                                    f'no se pudieron leer y no entraron al cargue')
+
             sql_cargue_archivo = """
                 INSERT INTO smc_core.cargue_archivo (
                     tipo_archivo, nombre_archivo, huella_archivo, usuario, ruta_archivo,
@@ -100,7 +123,7 @@ def procesar_y_llamar_paquete(
             out_id = cursor.var(oracledb.NUMBER)
             cursor.execute(sql_cargue_archivo, [
                 tipo_archivo, filename, huella_archivo, db_usuario, f"api_upload/{filename}",
-                total_filas, 0, 0, 0, 0, 0, 'EN_PROCESO', 'Iniciando procesamiento ANEXO_6A', out_id
+                total_filas, 0, 0, 0, 0, 0, 'EN_PROCESO', mensaje_inicial, out_id
             ])
             id_cargue = out_id.getvalue()[0]
             connection.commit()
